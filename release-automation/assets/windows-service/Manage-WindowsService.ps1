@@ -298,46 +298,85 @@ function Show-History {
     }
 }
 
+function Stop-WorkerServiceAndWaitForExit([string]$SvcName, [string]$TargetInstallPath) {
+    $svc = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Stopped') {
+        Write-Host "[1/4] Deteniendo servicio de Windows '$SvcName'..." -ForegroundColor Cyan
+        Stop-Service -Name $SvcName -Force -ErrorAction SilentlyContinue
+        try {
+            $svc.WaitForStatus('Stopped', '00:00:30')
+        } catch {
+            Write-Host "      Tiempo de espera agotado para Stopped, verificando proceso..." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "[1/4] Servicio '$SvcName' no esta en ejecucion, verificando procesos..." -ForegroundColor DarkGray
+    }
+
+    # Asegurar que el proceso FE.exe de esta ruta haya liberado todos los .dll en memoria
+    $expectedExe = (Join-Path $TargetInstallPath "FE.exe").ToLower()
+    for ($i = 0; $i -lt 15; $i++) {
+        $runningProcs = @(Get-CimInstance Win32_Process -Filter "Name = 'FE.exe'" -ErrorAction SilentlyContinue | Where-Object {
+            $_.ExecutablePath -and $_.ExecutablePath.ToLower() -eq $expectedExe
+        })
+        if ($runningProcs.Count -eq 0) {
+            break
+        }
+        if ($i -eq 10) {
+            Write-Host "      Forzando cierre del proceso FE.exe (PID: $($runningProcs.ProcessId -join ','))..." -ForegroundColor Yellow
+            foreach ($p in $runningProcs) {
+                Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
+    # Breve pausa adicional para que el kernel de Windows libere los handles de archivos .dll
+    Start-Sleep -Seconds 2
+}
+
 function Install-PackageFromZip([string]$ZipFile, [string]$TargetReleaseLabel) {
     $prevInfo = Get-LocalReleaseInfo
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
-    # 1. Extraer ZIP temporalmente para validar
+    # Extraer ZIP temporalmente antes de tocar el servicio para validar que el paquete es integro
     $tempExtract = Join-Path ([System.IO.Path]::GetTempPath()) "WorkerFE_Stage_$timestamp"
     New-Item -ItemType Directory -Force -Path $tempExtract | Out-Null
     Expand-Archive -Path $ZipFile -DestinationPath $tempExtract -Force
 
-    # 2. Crear Backup de la version actual
+    # 1. Detener el servicio de Windows y esperar que libere todos los .dll ANTES del backup
+    $svc = Get-Service -Name $ResolvedServiceName -ErrorAction SilentlyContinue
+    Stop-WorkerServiceAndWaitForExit -SvcName $ResolvedServiceName -TargetInstallPath $InstallPath
+
+    # 2. Crear Backup de la version actual (ahora que ningun archivo .dll esta en uso)
     New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
     $backupZip = Join-Path $BackupRoot ("WorkerFE_{0}_{1}.zip" -f $prevInfo.releaseTag, $timestamp)
     if (Test-Path (Join-Path $InstallPath "FE.dll")) {
-        Write-Host "[1/4] Creando respaldo de la version actual ($($prevInfo.releaseTag)) en $backupZip..." -ForegroundColor Cyan
+        Write-Host "[2/4] Creando respaldo de la version actual ($($prevInfo.releaseTag)) en $backupZip..." -ForegroundColor Cyan
         $itemsToBackup = Get-ChildItem -Path $InstallPath -Exclude "XMLs", "C:", "logs"
         if ($itemsToBackup) {
             Compress-Archive -Path $itemsToBackup.FullName -DestinationPath $backupZip -Force
         }
     } else {
-        Write-Host "[1/4] Instalacion limpia detectada en $InstallPath (sin version previa que respaldar)..." -ForegroundColor DarkGray
+        Write-Host "[2/4] Instalacion limpia detectada en $InstallPath (sin version previa que respaldar)..." -ForegroundColor DarkGray
     }
 
-    # 3. Detener el servicio de Windows (si existe)
-    $svc = Get-Service -Name $ResolvedServiceName -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -ne 'Stopped') {
-        Write-Host "[2/4] Deteniendo servicio de Windows '$ResolvedServiceName'..." -ForegroundColor Cyan
-        Stop-Service -Name $ResolvedServiceName -Force
-        $svc.WaitForStatus('Stopped', '00:00:30')
-    } else {
-        Write-Host "[2/4] Servicio '$ResolvedServiceName' no esta en ejecucion o aun no ha sido registrado, continuando..." -ForegroundColor DarkGray
-    }
-
-    # 4. Copiar archivos nuevos protegiendo config.json, autoupdate-settings.json y Manage-WorkerFE.ps1 en ejecucion
+    # 3. Copiar archivos nuevos protegiendo config.json, autoupdate-settings.json y Manage-WorkerFE.ps1 en ejecucion
     Write-Host "[3/4] Actualizando binarios en $InstallPath (protegiendo config.json)..." -ForegroundColor Cyan
     New-Item -ItemType Directory -Force -Path $InstallPath | Out-Null
     Get-ChildItem -Path $tempExtract -Exclude "config.json", "appsettings.Production.json", "deployments-history.log", "autoupdate-settings.json" | ForEach-Object {
-        try {
-            Copy-Item -Path $_.FullName -Destination $InstallPath -Recurse -Force
-        } catch {
-            if ($_.Name -ne "Manage-WorkerFE.ps1") { throw $_ }
+        $copied = $false
+        for ($retry = 1; $retry -le 5; $retry++) {
+            try {
+                Copy-Item -Path $_.FullName -Destination $InstallPath -Recurse -Force
+                $copied = $true
+                break
+            } catch {
+                if ($_.Name -eq "Manage-WorkerFE.ps1") {
+                    $copied = $true
+                    break
+                }
+                if ($retry -eq 5) { throw $_ }
+                Start-Sleep -Seconds 1
+            }
         }
     }
 
@@ -357,11 +396,12 @@ function Install-PackageFromZip([string]$ZipFile, [string]$TargetReleaseLabel) {
         $newInfo.releaseTag, $newInfo.deploymentId, $newInfo.commitSha, $env:USERNAME
     Add-Content -Path $historyFile -Value $logLine -Encoding UTF8
 
-    # 5. Iniciar el servicio nuevamente (si existe)
-    if ($svc) {
+    # 4. Iniciar el servicio nuevamente (si existe)
+    $svcAfter = Get-Service -Name $ResolvedServiceName -ErrorAction SilentlyContinue
+    if ($svcAfter) {
         Write-Host "[4/4] Iniciando servicio de Windows '$ResolvedServiceName'..." -ForegroundColor Cyan
         Start-Service -Name $ResolvedServiceName
-        $svc.WaitForStatus('Running', '00:00:30')
+        $svcAfter.WaitForStatus('Running', '00:00:30')
     } else {
         Write-Host "[4/4] Binarios listos. Si desea registrar e iniciar el servicio de Windows ejecute: .\Manage-WorkerFE.ps1 -Action install-service" -ForegroundColor Yellow
     }
