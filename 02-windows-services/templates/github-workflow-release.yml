@@ -1,0 +1,129 @@
+name: Build and Publish Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag de Release (ej. v1.2.0 o v1.2.0-rc.1)'
+        required: true
+        default: 'v1.0.0-rc.1'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Windows Service Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 6
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      - name: Prepare Release Metadata
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ github.event.inputs.release_tag }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+
+          $isPreRelease = $tag -match "-"
+          $channel = if ($isPreRelease) { "rc" } else { "stable" }
+          $idPrefix = if ($isPreRelease) { "RC" } else { "REL" }
+
+          if ($tag -match '^v?(\d+\.\d+\.\d+)') {
+            $cleanVer = $Matches[1]
+          } else {
+            $cleanVer = "1.0.0"
+          }
+
+          $shortSha = (git rev-parse --short HEAD).Trim()
+          $timestamp = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
+          $isoUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $deploymentId = "$idPrefix-$tag-$shortSha-$timestamp"
+
+          "release_tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "clean_version=$cleanVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "commit_sha=$shortSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "deployment_id=$deploymentId" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "published_utc=$isoUtc" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "channel=$channel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_prerelease=$($isPreRelease.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          Write-Host "Release Tag   : $tag (Channel: $channel)"
+          Write-Host "Deployment ID : $deploymentId"
+
+      - name: Run Unit Tests
+        run: dotnet test FE.Tests/FE.Tests.csproj -c Release
+
+      - name: Publish WorkerFE (win-x64)
+        run: >
+          dotnet publish WorkerFE/FE.csproj
+          -c Release
+          -r win-x64
+          --self-contained false
+          -p:Version=${{ steps.meta.outputs.clean_version }}
+          -p:ReleaseTag=${{ steps.meta.outputs.release_tag }}
+          -p:SourceRevisionId=${{ steps.meta.outputs.commit_sha }}
+          -o ./publish_output
+
+      - name: Generate release-manifest.json and Package ZIP
+        id: package
+        shell: pwsh
+        run: |
+          # Remove local development config files from release package to avoid overwriting production settings
+          Remove-Item -Path "./publish_output/config.json" -ErrorAction SilentlyContinue
+
+          $manifest = [ordered]@{
+            releaseTag       = "${{ steps.meta.outputs.release_tag }}"
+            channel          = "${{ steps.meta.outputs.channel }}"
+            deploymentId     = "${{ steps.meta.outputs.deployment_id }}"
+            commitSha        = "${{ steps.meta.outputs.commit_sha }}"
+            publishedAtUtc   = "${{ steps.meta.outputs.published_utc }}"
+            installedAtLocal = ""
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path "./publish_output/release-manifest.json" -Encoding UTF8
+
+          # Include management script in the release package
+          Copy-Item -Path "./deploy/Manage-WorkerFE.ps1" -Destination "./publish_output/Manage-WorkerFE.ps1" -Force
+
+          $zipName = "WorkerFE-${{ steps.meta.outputs.release_tag }}-win-x64.zip"
+          Compress-Archive -Path "./publish_output/*" -DestinationPath "./$zipName" -Force
+          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: "Release ${{ steps.meta.outputs.release_tag }} (${{ steps.meta.outputs.deployment_id }})"
+          prerelease: ${{ steps.meta.outputs.is_prerelease == 'true' }}
+          body: |
+            ### Información del Despliegue
+            - **Release Tag:** `${{ steps.meta.outputs.release_tag }}`
+            - **Canal:** `${{ steps.meta.outputs.channel }}` (${{ steps.meta.outputs.is_prerelease == 'true' && 'Release Candidate / Pruebas' || 'Producción Estable' }})
+            - **Deployment ID:** `${{ steps.meta.outputs.deployment_id }}`
+            - **Commit SHA:** `${{ steps.meta.outputs.commit_sha }}`
+            - **Fecha Publicación (UTC):** `${{ steps.meta.outputs.published_utc }}`
+
+            ### Cómo actualizar en el servidor Windows
+            ```powershell
+            .\Manage-WorkerFE.ps1 -Action status
+            .\Manage-WorkerFE.ps1 -Action update -Tag ${{ steps.meta.outputs.release_tag }}
+            ```
+          files: |
+            ./WorkerFE-${{ steps.meta.outputs.release_tag }}-win-x64.zip
+            ./publish_output/release-manifest.json
+          generate_release_notes: true
