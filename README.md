@@ -1,92 +1,76 @@
-# 🚀 Release & Deployment Automation Playbooks
+# 🚀 Release & Deployment Automation (AI Skill & Playbooks)
 
-Repositorio central de arquitectura, estándares, flujos CI/CD (GitHub Actions) y scripts de automatización para el control de versiones por **Release Tags (`Stable` & `RC`)**, trazabilidad de despliegues (`Deployment ID` / `release-manifest.json`) y actualización automatizada en múltiples tipos de infraestructura.
+Un **AI Agent Skill (`release-automation`)** y biblioteca de playbooks para automatizar el ciclo de vida de releases basados en **Git Tags (`Stable vX.Y.Z` y `Release Candidates vX.Y.Z-rc.N`)**, trazabilidad por **`Deployment ID` (`release-manifest.json`)** y auto-actualización desatendida para **Servicios de Windows (.NET Workers)**, **Aplicaciones Web / APIs (Laravel, Node.js, React)**, **Docker** y **Herramientas CLI**.
 
----
-
-## 📂 Estructura por Categorías
-
-| Categoría | Carpeta | Casos de Uso | Estrategia de Despliegue y Auto-Update |
-| :--- | :--- | :--- | :--- |
-| **01. Estándar de Versionamiento y Tags** | [`01-versioning-strategy/`](./01-versioning-strategy/README.md) | Todos los proyectos | SemVer (`vX.Y.Z`), Release Candidates (`vX.Y.Z-rc.N`), `release-manifest.json` y flujo `develop` $\rightarrow$ `master`. |
-| **02. Servicios de Windows (.NET Workers)** | [`02-windows-services/`](./02-windows-services/README.md) | `.NET Worker Service`, integraciones SAP B1 / ERP, demonios on-premise | GitHub Releases + Gestor PowerShell (`Manage-Service.ps1`) con autodetección `Win32_Service`, preservación de `config.json`, `rollback` y Tarea Programada (`SYSTEM`). |
-| **03. Aplicaciones Web y APIs (Backend / Fullstack)** | [`03-web-apps-and-apis/`](./03-web-apps-and-apis/README.md) | APIs en Laravel/PHP, Node.js, .NET Web API, SPAs (React/Next/Vue) | Despliegue Zero-Downtime por Symlinks (`releases/<tag>` $\rightarrow$ `current`), endpoint `/api/version` y Webhook/Cron puller por canal (`stable`/`rc`). |
-| **04. Contenedores Docker y Cloud / VPS** | [`04-docker-and-containers/`](./04-docker-and-containers/README.md) | Microservicios, Docker Compose, GHCR (`ghcr.io`), Kubernetes | Tags de imagen inmutables (`:v1.2.0`, `:v1.2.0-rc.1`), labels OCI de trazabilidad y actualización automática por canal. |
-| **05. Herramientas CLI, Scripts y Cron Jobs** | [`05-cli-and-cron-jobs/`](./05-cli-and-cron-jobs/README.md) | Utilidades de consola, sincronizadores por lotes, ETLs | Binarios autocontenidos (Single-File) con auto-actualizador integrado (`--self-update`). |
+Compatible con **Claude Code**, **Google Antigravity**, **Cursor**, **Codex** y el instalador estándar `npx skills`.
 
 ---
 
-## 🎯 Principios Fundamentales del Sistema
+## 🤖 Instalación como AI Skill (Para Cualquier Agente)
 
-### 1. Dos Canales Oficiales Basados en Git Tags
-En lugar de desplegar commits sueltos difíciles de auditar, **todo despliegue responde a un Tag de Git**:
-
-```mermaid
-flowchart LR
-    DEV["Rama develop"] -->|"git tag v1.2.0-rc.1"| RC["GitHub Pre-Release (Canal: rc)"]
-    RC -->|"Auto-Update QA"| QA["Servidor QA / Pruebas"]
-    DEV -->|"Pull Request Aprobado"| MAIN["Rama master / main"]
-    MAIN -->|"git tag v1.2.0"| STABLE["GitHub Latest Release (Canal: stable)"]
-    STABLE -->|"Auto-Update Prod"| PROD["Servidor Producción"]
+### Opción 1: Instalación Global con `npx skills` (Claude Code / Cursor / Antigravity)
+```bash
+npx skills add https://github.com/kapb94/release-automation-playbooks -g -y
 ```
 
-- **Canal `rc` (`vX.Y.Z-rc.N`):**
-  - Se etiqueta desde `develop`.
-  - GitHub Actions lo publica automáticamente con `prerelease: true`.
-  - Genera un `Deployment ID` con prefijo `RC-` (ej. `RC-v3.0.0-rc.1-ab5649f-20261018-122500`).
-  - Los servidores de **Producción lo ignoran por completo**, mientras que los servidores de **Pruebas/QA** suscritos al canal `rc` lo descargan e instalan automáticamente.
-- **Canal `stable` (`vX.Y.Z`):**
-  - Se etiqueta desde `master` / `main` una vez aprobado el PR.
-  - GitHub Actions lo publica como `Latest Release`.
-  - Genera un `Deployment ID` con prefijo `REL-` (ej. `REL-v3.0.0-972dbe4-20261018-140000`).
-  - Los servidores suscritos al canal `stable` se actualizan automáticamente.
+### Opción 2: Instalación Directa en Antigravity / Claude Code
+```bash
+# Para Google Antigravity:
+git clone https://github.com/kapb94/release-automation-playbooks.git /tmp/rel-skill && \
+  cp -r /tmp/rel-skill/release-automation ~/.gemini/config/skills/release-automation
 
----
-
-### 2. El Contrato Universal: `release-manifest.json`
-Sin importar si el proyecto es un Servicio de Windows en C#, una API en Laravel/Node o un Frontend en React, todo artefacto compilado incluye en su raíz un archivo `release-manifest.json`:
-
-```json
-{
-  "appName": "WorkerFE",
-  "releaseTag": "v3.0.0-rc.2",
-  "channel": "rc",
-  "deploymentId": "RC-v3.0.0-rc.2-46a4fdb-20261018-123345",
-  "commitSha": "46a4fdb",
-  "publishedAtUtc": "2026-10-18T12:33:45Z",
-  "installedAtLocal": "2026-10-18 06:35:10"
-}
+# Para Claude Code:
+cp -r /tmp/rel-skill/release-automation ~/.claude/skills/release-automation
 ```
 
-Esto permite responder en menos de 2 segundos en cualquier servidor o aplicación:
-1. **¿Qué versión exacta está corriendo?** (`releaseTag` + `deploymentId`)
-2. **¿A qué commit corresponde?** (`commitSha`)
-3. **¿Es una versión de pruebas (`rc`) o estable (`stable`)?** (`channel`)
-4. **¿Cuándo se compiló y cuándo se instaló en este servidor?** (`publishedAtUtc` / `installedAtLocal`)
-5. **¿Está al día con GitHub Releases en su canal?**
+### Cómo Invocar el Skill en tu Agente de IA
+Simplemente pídele en lenguaje natural o con `/release-automation`:
+- *"Configura la automatización de releases por tags (RC y Stable) y el script de auto-update para este servicio de Windows"*
+- *"Agrega `/api/version` con `release-manifest.json` y el workflow de despliegue para esta API"*
+- *"Crea el siguiente tag RC desde `develop` y publícalo en GitHub Releases"*
 
 ---
 
-### 3. Reglas de Oro de Seguridad en Despliegues
-1. **Nunca empaquetar secretos ni configuraciones locales en el artefacto del Release:** Archivos como `config.json`, `.env` o `appsettings.Production.json` se eliminan explícitamente durante el paso de `publish` en CI/CD y se excluyen al descomprimir en el servidor destino.
-2. **Respaldo previo obligatorio (`Backup-Before-Deploy`):** Antes de detener un servicio o cambiar un symlink, el actualizador comprime o conserva la versión anterior para permitir un **`rollback` en un solo comando**.
-3. **Bitácora local inmutable (`deployments-history.log`):** Cada actualización o rollback deja una línea de auditoría en el servidor indicando de qué `Deployment ID` a qué `Deployment ID` pasó, en qué fecha y bajo qué canal.
-4. **Tokens con privilegios mínimos:** Los servidores que descargan artefactos desde repositorios privados utilizan un **GitHub Fine-Grained Personal Access Token** limitado exclusivamente al repositorio correspondiente con permiso único `Contents: Read-only`.
+## 🗂️ Estructura del Repositorio
+
+```text
+release-automation-playbooks/
+├── release-automation/                  # 🧠 AI AGENT SKILL (Estándar SKILL.md)
+│   ├── SKILL.md                         # Frontmatter + Flujo paso a paso para IAs
+│   ├── scripts/
+│   │   ├── detect-project.sh            # Autodetecta categoría, repo y últimos tags -> JSON
+│   │   └── cut-release.sh               # Incrementa y publica tags RC (vX.Y.Z-rc.N) o Stable
+│   ├── references/                      # Documentación cargada bajo demanda por el agente
+│   │   ├── versioning-strategy.md
+│   │   ├── windows-service.md
+│   │   ├── webapp-api.md
+│   │   ├── docker.md
+│   │   └── cli.md
+│   └── assets/                          # Plantillas listas para inyectar en proyectos
+│       ├── windows-service/
+│       │   ├── DeploymentInfo.cs
+│       │   ├── github-workflow-release.yml
+│       │   └── Manage-WindowsService.ps1
+│       └── webapp-api/
+│           ├── github-workflow-web-release.yml
+│           └── manage-webapp.sh
+├── 01-versioning-strategy/              # 📖 Guía Humana: SemVer, RC vs Stable, Tokens y PRs
+├── 02-windows-services/                 # 📖 Guía Humana: Servicios de Windows (.NET Workers)
+├── 03-web-apps-and-apis/                # 📖 Guía Humana: Web Apps / APIs (Zero-Downtime Symlinks)
+├── 04-docker-and-containers/            # 📖 Guía Humana: Contenedores Docker y GHCR
+└── 05-cli-and-cron-jobs/                # 📖 Guía Humana: Ejecutables CLI Single-File
+```
 
 ---
 
-## 🛠️ Cómo Usar Este Repositorio en un Proyecto Nuevo
+## 🎯 Los 4 Pilares que Automatiza Este Skill
 
-1. **Elige la categoría de tu proyecto** en las carpetas numeradas (`02-windows-services`, `03-web-apps-and-apis`, `04-docker-and-containers`, `05-cli-and-cron-jobs`).
-2. **Copia el workflow de GitHub Actions** (`release.yml`) a `.github/workflows/release.yml` de tu proyecto.
-3. **Copia el script gestor/actualizador** (`Manage-Service.ps1` para Windows o `deploy-web.sh` para Linux/Web) a la carpeta `deploy/` de tu proyecto.
-4. **Crea tu primer tag RC o Stable:**
-   ```bash
-   # Para pruebas desde develop:
-   git tag -a v1.0.0-rc.1 -m "Release Candidate v1.0.0-rc.1"
-   git push origin v1.0.0-rc.1
-
-   # Para producción desde main/master:
-   git tag -a v1.0.0 -m "Release v1.0.0"
-   git push origin v1.0.0
-   ```
+1. **Dos Canales Controlados por Git Tags (`rc` y `stable`):**
+   - `vX.Y.Z-rc.N` (desde `develop`) $\rightarrow$ `prerelease: true` en GitHub Releases (`Deployment ID: RC-...`).
+   - `vX.Y.Z` (desde `master`/`main`) $\rightarrow$ `Latest Release` en GitHub Releases (`Deployment ID: REL-...`).
+2. **Contrato Universal `release-manifest.json`:**
+   - Todo artefacto incluye `releaseTag`, `channel`, `deploymentId`, `commitSha`, `publishedAtUtc` e `installedAtLocal`, consultable por CLI (`--version`), logs de arranque o endpoint HTTP (`/api/version`).
+3. **Protección de Configuración y Rollback Instantáneo:**
+   - Excluye `config.json` y `.env` del paquete de release y del despliegue, creando un backup automático previo para hacer `rollback` en un solo comando.
+4. **Auto-Actualización Suscrita por Canal:**
+   - Configura una Tarea Programada de Windows (`Manage-WindowsService.ps1 -Action register-autoupdate -Channel rc|stable`) o un Cron en Linux (`manage-webapp.sh register-cron`) que vigila únicamente el canal asignado a ese servidor.
